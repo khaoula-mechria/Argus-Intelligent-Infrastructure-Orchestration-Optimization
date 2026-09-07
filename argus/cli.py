@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -11,6 +12,8 @@ from . import __version__
 from .adapters import BACKENDS, AdapterError, build_adapter
 from .adapters.base import UnitStatus
 from .config import ArgusConfig, ConfigError, load_config, parse_config_file
+from .explainer import DEFAULT_MODEL, Explainer, ExplainerError, render_apply_plan
+from .optimizer import DEFAULT_PERIOD_DAYS, RESOURCE_KINDS, Optimizer, OptimizerError
 from .orchestrator import Orchestrator, PlanError
 
 _STATUS_COLOURS = {
@@ -193,8 +196,6 @@ def graph(
         click.echo(nx.nx_pydot.to_pydot(plan.graph).to_string())
         return
 
-    import json
-
     click.echo(
         json.dumps(
             {
@@ -218,6 +219,148 @@ def graph(
             indent=2,
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# Module 2 -- optimization
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--service", help="ECS service name. Shorthand for --resource ecs-service.")
+@click.option("--resource", "resource_id", help="Identifier of the resource to analyse.")
+@click.option(
+    "--type",
+    "resource_type",
+    type=click.Choice(sorted(RESOURCE_KINDS)),
+    default="ecs-service",
+    show_default=True,
+    help="Kind of resource --resource names.",
+)
+@click.option("--cluster", help="ECS cluster. Discovered automatically when omitted.")
+@click.option("--region", help="AWS region. Falls back to AWS_REGION.")
+@click.option("--days", default=DEFAULT_PERIOD_DAYS, show_default=True, help="Analysis window.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the report as JSON.")
+def optimize(
+    service: str | None,
+    resource_id: str | None,
+    resource_type: str,
+    cluster: str | None,
+    region: str | None,
+    days: int,
+    as_json: bool,
+) -> None:
+    """Compare CloudWatch usage against the current size of a resource."""
+    identifier = service or resource_id
+    if not identifier:
+        raise click.ClickException("pass --service <name> or --resource <id>")
+    if service and resource_id:
+        raise click.ClickException("--service and --resource are two names for the same argument")
+    if service:
+        resource_type = "ecs-service"
+
+    try:
+        report = Optimizer(region=region, period_days=days).analyse(
+            identifier, resource_type=resource_type, cluster=cluster
+        )
+    except OptimizerError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if as_json:
+        click.echo(json.dumps(report.to_dict(), indent=2, default=str))
+    else:
+        click.echo(report.summary())
+
+
+# ---------------------------------------------------------------------------
+# Module 3 -- explanation
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--service", help="ECS service name to analyse and then explain.")
+@click.option("--resource", "resource_id", help="Identifier of the resource to analyse.")
+@click.option(
+    "--type",
+    "resource_type",
+    type=click.Choice(sorted(RESOURCE_KINDS)),
+    default="ecs-service",
+    show_default=True,
+)
+@click.option("--cluster", help="ECS cluster. Discovered automatically when omitted.")
+@click.option("--region", help="AWS region.")
+@click.option("--days", default=DEFAULT_PERIOD_DAYS, show_default=True, help="Analysis window.")
+@click.option(
+    "--report",
+    "report_path",
+    type=click.Path(exists=True),
+    help="Explain a report saved earlier by `argus optimize --json` instead of querying AWS.",
+)
+@click.option("--model", default=DEFAULT_MODEL, show_default=True, help="Anthropic model.")
+@click.option("--ask", help="An extra question to answer about the report.")
+@click.option(
+    "--apply",
+    "show_apply",
+    is_flag=True,
+    help="Also print the commands that would apply the recommendation. Argus never runs them.",
+)
+def explain(
+    service: str | None,
+    resource_id: str | None,
+    resource_type: str,
+    cluster: str | None,
+    region: str | None,
+    days: int,
+    report_path: str | None,
+    model: str,
+    ask: str | None,
+    show_apply: bool,
+) -> None:
+    """Explain an optimization report in plain language."""
+    if report_path:
+        with open(report_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    else:
+        identifier = service or resource_id
+        if not identifier:
+            raise click.ClickException("pass --service, --resource, or --report <file>")
+        if service:
+            resource_type = "ecs-service"
+        try:
+            payload = (
+                Optimizer(region=region, period_days=days)
+                .analyse(identifier, resource_type=resource_type, cluster=cluster)
+                .to_dict()
+            )
+        except OptimizerError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    try:
+        explanation = Explainer(model=model).explain(payload, question=ask)
+    except ExplainerError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(explanation.text)
+    click.echo("")
+    click.secho(
+        "-- explained by " + explanation.model
+        + (" (%d in / %d out tokens)" % (explanation.input_tokens or 0, explanation.output_tokens or 0)),
+        fg="cyan",
+    )
+
+    if show_apply:
+        commands = render_apply_plan(payload)
+        click.echo("")
+        if not commands:
+            click.echo("No change is proposed, so there is nothing to apply.")
+            return
+        click.secho(
+            "Argus does not apply anything. Review these commands and run them yourself:",
+            fg="yellow",
+        )
+        click.echo("")
+        for line in commands:
+            click.echo("  " + line)
 
 
 # ---------------------------------------------------------------------------
