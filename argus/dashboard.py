@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from argus.adapters import BACKENDS, AdapterError, build_adapter  # noqa: E402
 from argus.adapters.base import UnitStatus  # noqa: E402
+from argus.aws import AwsSettings  # noqa: E402
 from argus.config import ConfigError, load_config  # noqa: E402
 from argus.explainer import (  # noqa: E402
     DEFAULT_MODEL,
@@ -38,7 +39,7 @@ from argus.optimizer import (  # noqa: E402
     Optimizer,
     OptimizerError,
 )
-from argus.orchestrator import Orchestrator, PlanError  # noqa: E402
+from argus.orchestrator import STRATEGIES, Orchestrator, PlanError  # noqa: E402
 
 #: Node fill per status. Deliberately readable in both Streamlit themes.
 STATUS_STYLE = {
@@ -205,12 +206,14 @@ def backend_banner(backend: str, plan) -> None:
 # ---------------------------------------------------------------------------
 
 
-def render_deployment_tab(backend: str, path: str) -> None:
+def render_deployment_tab(backend: str, path: str, endpoint_url: str = "") -> None:
     st.subheader("Dependency graph and deployment")
 
     try:
         config = load_config(path)
         config.backend = backend
+        if endpoint_url:
+            config.endpoint_url = endpoint_url
         adapter = build_adapter(backend, config)
         orchestrator = Orchestrator(
             adapter, max_parallel=config.max_parallel, extra_dependencies=config.depends_on
@@ -227,9 +230,14 @@ def render_deployment_tab(backend: str, path: str) -> None:
     columns[1].metric("Dependencies", plan.graph.number_of_edges())
     columns[2].metric("Waves", len(plan.waves))
     columns[3].metric(
-        "Sequential steps saved",
-        plan.unit_count - len(plan.waves),
-        help="Units minus waves: how many sequential steps the parallel plan removes.",
+        "Critical path",
+        len(plan.critical_path),
+        help="The longest dependency chain. No scheduler can be shorter than this, "
+        "whatever the level of parallelism, so it is the structural limit of the project.",
+    )
+    st.caption(
+        "critical path: " + " \u2192 ".join(plan.critical_path)
+        + "  \u00b7  peak concurrency: " + str(plan.max_concurrency)
     )
 
     if plan.unresolved:
@@ -262,11 +270,20 @@ def render_deployment_tab(backend: str, path: str) -> None:
     st.divider()
     st.markdown("**Run**")
 
-    dry_run = st.toggle(
+    controls = st.columns([2, 2])
+    dry_run = controls[0].toggle(
         "Dry run (no cloud call, simulated timings)",
         value=True,
         help="Leave this on to watch the graph animate without touching an AWS account.",
     )
+    strategy = controls[1].selectbox(
+        "Strategy",
+        STRATEGIES,
+        help="rolling starts each unit as soon as its own dependencies finish. "
+        "waves adds a barrier between generations -- slower, but it is the baseline "
+        "rolling is measured against.",
+    )
+    orchestrator.strategy = strategy
 
     confirmed = True
     if not dry_run:
@@ -279,14 +296,14 @@ def render_deployment_tab(backend: str, path: str) -> None:
         )
 
     if st.button("Deploy", type="primary", disabled=not confirmed):
-        run_deployment(orchestrator, plan, dry_run, graph_slot)
+        run_deployment(orchestrator, plan, dry_run, graph_slot, strategy)
 
     report = st.session_state.get("report")
     if report is not None:
         render_timing(report)
 
 
-def run_deployment(orchestrator, plan, dry_run: bool, graph_slot) -> None:
+def run_deployment(orchestrator, plan, dry_run: bool, graph_slot, strategy: str) -> None:
     """Deploy in a worker thread while the main thread repaints the graph."""
     statuses: dict[str, UnitStatus] = {unit.name: UnitStatus.PENDING for unit in plan.units}
     lock = threading.Lock()
@@ -298,7 +315,9 @@ def run_deployment(orchestrator, plan, dry_run: bool, graph_slot) -> None:
 
     def worker() -> None:
         try:
-            holder["report"] = orchestrator.run(plan, dry_run=dry_run, on_status=on_status)
+            holder["report"] = orchestrator.run(
+                plan, dry_run=dry_run, on_status=on_status, strategy=strategy
+            )
         except Exception as exc:
             holder["error"] = exc
 
@@ -337,12 +356,23 @@ def render_timing(report) -> None:
             "They demonstrate the wave structure; they do not predict a real deployment."
         )
 
-    columns = st.columns(3)
-    columns[0].metric("Parallel waves", "%.1f s" % report.wall_clock)
+    columns = st.columns(4)
+    columns[0].metric("Wall clock", "%.1f s" % report.wall_clock, help="strategy: " + report.strategy)
     columns[1].metric("Sequential equivalent", "%.1f s" % report.sequential_estimate)
     columns[2].metric(
-        "Saved", "%.1f s" % report.time_saved, delta="x%.2f" % report.speedup
+        "Critical path floor",
+        "%.1f s" % report.critical_path_duration,
+        help="The floor: the longest chain weighted by the measured durations. "
+        "No scheduler could have been faster than this.",
     )
+    columns[3].metric(
+        "Efficiency",
+        "%.0f%%" % (report.efficiency * 100),
+        delta="x%.2f vs sequential" % report.speedup,
+        help="Wall clock against the floor. Below 100% means time was spent waiting "
+        "on something other than a real dependency.",
+    )
+    st.caption("critical path: " + " \u2192 ".join(report.critical_path))
 
     st.dataframe(
         [
@@ -364,7 +394,7 @@ def render_timing(report) -> None:
 # ---------------------------------------------------------------------------
 
 
-def render_optimization_tab(region: str) -> None:
+def render_optimization_tab(region: str, endpoint_url: str = "") -> None:
     st.subheader("Rightsizing analysis")
     st.caption(
         "Reads CloudWatch and AWS Compute Optimizer. Nothing on this tab changes any "
@@ -387,7 +417,10 @@ def render_optimization_tab(region: str) -> None:
     if st.button("Analyse", type="primary", disabled=not identifier):
         with st.spinner("Reading CloudWatch..."):
             try:
-                report = Optimizer(region=region or None, period_days=int(days)).analyse(
+                settings = AwsSettings(
+                    region=region or None, endpoint_url=endpoint_url or None
+                )
+                report = Optimizer(settings=settings, period_days=int(days)).analyse(
                     identifier, resource_type=resource_type, cluster=cluster
                 )
             except OptimizerError as exc:
@@ -515,13 +548,24 @@ def main() -> None:
         "dependencies rather than following a fixed order."
     )
 
-    header = st.columns([1, 3, 1])
+    header = st.columns([1, 3, 1, 1])
     backend = header[0].selectbox("Backend", BACKENDS)
     path = header[1].text_input("Project path", value="infrastructure/cloudformation")
     region = header[2].text_input("Region", placeholder="eu-west-3")
+    endpoint_url = header[3].text_input(
+        "Endpoint",
+        placeholder="http://localhost:4566",
+        help="Point this at LocalStack to run everything without a cloud account. "
+        "Leave it empty to talk to AWS.",
+    ).strip()
+
+    if endpoint_url:
+        st.caption(
+            "\u26a1 Talking to " + endpoint_url + ", not to AWS. Nothing here touches a real account."
+        )
 
     # Changing the target invalidates statuses recorded for the previous one.
-    target = (backend, path)
+    target = (backend, path, endpoint_url)
     if st.session_state.get("target") != target:
         st.session_state["target"] = target
         st.session_state.pop("statuses", None)
@@ -532,9 +576,9 @@ def main() -> None:
     )
 
     with deployment:
-        render_deployment_tab(backend, path)
+        render_deployment_tab(backend, path, endpoint_url)
     with optimization:
-        render_optimization_tab(region)
+        render_optimization_tab(region, endpoint_url)
     with explanation:
         render_explanation_tab()
 

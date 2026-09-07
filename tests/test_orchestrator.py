@@ -5,10 +5,11 @@ from __future__ import annotations
 import threading
 import time
 
+import networkx as nx
 import pytest
 
 from argus.adapters.base import DeployableUnit, DeploymentResult, InfrastructureAdapter, UnitStatus
-from argus.orchestrator import Orchestrator, PlanError
+from argus.orchestrator import Orchestrator, PlanError, longest_path
 
 
 class FakeAdapter(InfrastructureAdapter):
@@ -197,3 +198,183 @@ def test_results_are_reported_in_plan_order_not_completion_order():
     orchestrator = Orchestrator(adapter)
     report = orchestrator.run(orchestrator.plan("."))
     assert [result.unit for result in report.results] == ["a", "b", "c", "d"]
+
+
+# -- critical path ----------------------------------------------------------
+
+
+def test_longest_path_weights_nodes_not_edges():
+    graph = nx.DiGraph([("a", "b"), ("b", "d"), ("a", "c"), ("c", "d")])
+    weights = {"a": 1.0, "b": 5.0, "c": 1.0, "d": 1.0}
+    path, total = longest_path(graph, lambda name: weights[name])
+
+    assert path == ["a", "b", "d"]
+    assert total == pytest.approx(7.0)
+
+
+def test_longest_path_on_an_empty_graph():
+    assert longest_path(nx.DiGraph(), lambda _: 1.0) == ([], 0.0)
+
+
+def test_plan_reports_the_structural_critical_path():
+    plan = Orchestrator(FakeAdapter(diamond())).plan(".")
+    # a -> (b|c) -> d: three units deep whichever branch is taken.
+    assert len(plan.critical_path) == 3
+    assert plan.critical_path[0] == "a"
+    assert plan.critical_path[-1] == "d"
+
+
+def test_plan_reports_peak_concurrency():
+    assert Orchestrator(FakeAdapter(diamond())).plan(".").max_concurrency == 2
+
+
+# -- rolling vs waves -------------------------------------------------------
+
+
+class VariableAdapter(FakeAdapter):
+    """Deployments whose duration differs per unit, to expose wave barriers."""
+
+    def __init__(self, units, durations):
+        super().__init__(units)
+        self._durations = durations
+        self.started_at: dict[str, float] = {}
+        self.origin = time.monotonic()
+
+    def deploy_unit(self, unit):
+        started = time.monotonic()
+        with self._lock:
+            self.started_at[unit.name] = started - self.origin
+        time.sleep(self._durations.get(unit.name, 0.0))
+        return DeploymentResult.timed(unit.name, UnitStatus.COMPLETE, started, "fake")
+
+
+def barrier_shaped():
+    """One slow unit and one fast unit in the first wave.
+
+    `codebuild` depends only on the fast `ecr`, so a wave barrier makes it wait
+    for the unrelated slow `vpc` before it can start.
+    """
+    units = [
+        unit("vpc", provides=["V"]),
+        unit("ecr", provides=["E"]),
+        unit("codebuild", provides=["C"], requires=["E"]),
+        unit("iam", requires=["C"]),
+        unit("subnet", requires=["V"]),
+    ]
+    durations = {"vpc": 0.6, "ecr": 0.05, "codebuild": 0.05, "iam": 0.05, "subnet": 0.05}
+    return units, durations
+
+
+def test_rolling_starts_a_unit_without_waiting_for_an_unrelated_slow_sibling():
+    units, durations = barrier_shaped()
+    adapter = VariableAdapter(units, durations)
+    orchestrator = Orchestrator(adapter, max_parallel=8, strategy="rolling")
+    orchestrator.run(orchestrator.plan("."))
+
+    # codebuild only needs ecr (0.05s). It must not have waited on vpc (0.6s).
+    assert adapter.started_at["codebuild"] < 0.4
+
+
+def test_waves_makes_that_same_unit_wait_for_the_barrier():
+    units, durations = barrier_shaped()
+    adapter = VariableAdapter(units, durations)
+    orchestrator = Orchestrator(adapter, max_parallel=8, strategy="waves")
+    orchestrator.run(orchestrator.plan("."))
+
+    # This is the cost the rolling scheduler removes, stated as a test rather
+    # than asserted in prose.
+    assert adapter.started_at["codebuild"] >= 0.5
+
+
+def test_rolling_reaches_the_critical_path_floor():
+    units, durations = barrier_shaped()
+    orchestrator = Orchestrator(VariableAdapter(units, durations), max_parallel=8)
+    report = orchestrator.run(orchestrator.plan("."))
+
+    # Nothing can be faster than the critical path; rolling should be close to it.
+    assert report.wall_clock >= report.critical_path_duration - 0.01
+    assert report.efficiency > 0.85
+
+
+def test_max_parallel_one_degrades_to_a_sequential_run():
+    units, durations = barrier_shaped()
+    orchestrator = Orchestrator(VariableAdapter(units, durations), max_parallel=1)
+    report = orchestrator.run(orchestrator.plan("."))
+
+    assert report.efficiency < 1.0
+    assert report.wall_clock >= report.sequential_estimate - 0.05
+
+
+# -- robustness -------------------------------------------------------------
+
+
+def test_duplicate_unit_names_are_rejected_rather_than_collapsed():
+    # Two units on one graph node would look like a complete plan while one of
+    # them never deployed.
+    units = [unit("vpc"), unit("vpc")]
+    with pytest.raises(PlanError, match="share a name"):
+        Orchestrator(FakeAdapter(units)).plan(".")
+
+
+def test_a_failure_skips_the_whole_downstream_chain_not_just_the_next_unit():
+    units = [
+        unit("a", provides=["A"]),
+        unit("b", provides=["B"], requires=["A"]),
+        unit("c", requires=["B"]),
+    ]
+    adapter = FakeAdapter(units, failures={"a"})
+    orchestrator = Orchestrator(adapter)
+    report = orchestrator.run(orchestrator.plan("."))
+
+    statuses = {result.unit: result.status for result in report.results}
+    assert statuses == {
+        "a": UnitStatus.FAILED,
+        "b": UnitStatus.SKIPPED,
+        "c": UnitStatus.SKIPPED,  # transitively, not only the direct successor
+    }
+
+
+def test_cancelling_stops_scheduling_and_still_reports_every_unit():
+    units = [unit(name) for name in "abcdef"]
+    adapter = FakeAdapter(units, delay=0.1)
+    orchestrator = Orchestrator(adapter, max_parallel=2)
+    plan = orchestrator.plan(".")
+
+    def cancel_soon(name, status):
+        if status == UnitStatus.IN_PROGRESS:
+            orchestrator.cancel()
+
+    report = orchestrator.run(plan, on_status=cancel_soon)
+
+    assert report.cancelled
+    # Every unit has a row: a report that omits units is worse than a bad one.
+    assert len(report.results) == len(units)
+    assert any("cancelled" in result.detail for result in report.results)
+
+
+def test_both_strategies_agree_on_the_final_statuses():
+    units, durations = barrier_shaped()
+    outcomes = []
+    for strategy in ("rolling", "waves"):
+        orchestrator = Orchestrator(VariableAdapter(units, durations), strategy=strategy)
+        report = orchestrator.run(orchestrator.plan("."))
+        outcomes.append({result.unit: result.status for result in report.results})
+
+    assert outcomes[0] == outcomes[1]
+
+
+def test_an_unknown_strategy_is_rejected_at_construction():
+    with pytest.raises(ValueError, match="unknown strategy"):
+        Orchestrator(FakeAdapter([]), strategy="greedy")
+
+
+def test_report_serialises_for_ci():
+    adapter = FakeAdapter(diamond(), delay=0.02)
+    orchestrator = Orchestrator(adapter)
+    payload = orchestrator.run(orchestrator.plan(".")).to_dict()
+
+    assert payload["strategy"] == "rolling"
+    assert payload["succeeded"] is True
+    assert payload["critical_path"][0] == "a"
+    assert len(payload["units"]) == 4
+    assert set(payload["units"][0]) == {"name", "status", "duration", "detail"}

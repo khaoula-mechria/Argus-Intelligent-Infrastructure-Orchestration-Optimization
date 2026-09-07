@@ -48,6 +48,10 @@ class ArgusConfig:
     backend: str | None = None
     path: str | None = None
     region: str | None = None
+    profile: str | None = None
+    #: Alternative service endpoint. Point it at LocalStack to run the whole
+    #: tool without a cloud account -- see docs/guide-local.md.
+    endpoint_url: str | None = None
     parameters: dict[str, str] = field(default_factory=dict)
     stack_name_prefix: str = ""
     max_parallel: int = 8
@@ -60,6 +64,14 @@ class ArgusConfig:
     @property
     def is_empty(self) -> bool:
         return self.source is None
+
+    def aws_settings(self):
+        """The account/endpoint half of this config, for the AWS clients."""
+        from .aws import AwsSettings
+
+        return AwsSettings(
+            region=self.region, profile=self.profile, endpoint_url=self.endpoint_url
+        )
 
 
 def find_config(path: str) -> str | None:
@@ -107,6 +119,8 @@ def parse_config(raw: dict[str, Any], base_dir: str = ".") -> ArgusConfig:
 
     config.backend = _optional_str(raw, "backend")
     config.region = _optional_str(raw, "region")
+    config.profile = _optional_str(raw, "profile")
+    config.endpoint_url = _optional_str(raw, "endpoint_url")
     config.stack_name_prefix = _optional_str(raw, "stack_name_prefix") or ""
 
     target = _optional_str(raw, "path")

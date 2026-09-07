@@ -11,10 +11,11 @@ import click
 from . import __version__
 from .adapters import BACKENDS, AdapterError, build_adapter
 from .adapters.base import UnitStatus
+from .aws import AwsSettings
 from .config import ArgusConfig, ConfigError, load_config, parse_config_file
 from .explainer import DEFAULT_MODEL, Explainer, ExplainerError, render_apply_plan
 from .optimizer import DEFAULT_PERIOD_DAYS, RESOURCE_KINDS, Optimizer, OptimizerError
-from .orchestrator import Orchestrator, PlanError
+from .orchestrator import STRATEGIES, Orchestrator, PlanError
 
 _STATUS_COLOURS = {
     UnitStatus.PENDING: "white",
@@ -53,6 +54,34 @@ def _parse_parameters(values: tuple[str, ...]) -> dict[str, str]:
     return parameters
 
 
+def _preflight(adapter, plan) -> None:
+    """Validate every template before the first resource is created.
+
+    The worst outcome of a parallel deploy is a half-built environment: three
+    waves succeed, then a malformed template five stacks in aborts the run. One
+    validation pass up front turns that into an error before anything exists.
+    """
+    validate = getattr(adapter, "validate", None)
+    if validate is None:
+        return
+
+    try:
+        failures = validate(plan.units)
+    except Exception as exc:  # no credentials, no endpoint: not a reason to stop
+        click.secho("skipping pre-flight validation: " + str(exc), fg="yellow")
+        return
+
+    if not failures:
+        click.secho("pre-flight: " + str(plan.unit_count) + " template(s) validated", fg="green")
+        return
+
+    for name, message in sorted(failures.items()):
+        click.secho("invalid template " + name + ": " + message, fg="red")
+    raise click.ClickException(
+        str(len(failures)) + " template(s) failed validation; nothing was deployed"
+    )
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, prog_name="argus")
 def cli() -> None:
@@ -70,13 +99,31 @@ def cli() -> None:
 @click.option("--config", "config_path", type=click.Path(exists=True), help="Explicit argus.yaml.")
 @click.option("--parameter", "-p", multiple=True, help="Key=Value, repeatable. Overrides argus.yaml.")
 @click.option("--region", help="AWS region. Overrides argus.yaml and AWS_REGION.")
-@click.option("--max-parallel", type=int, help="Cap on units deployed at once inside a wave.")
-@click.option("--plan-only", is_flag=True, help="Show the waves and exit without deploying.")
+@click.option("--profile", help="AWS named profile.")
+@click.option(
+    "--endpoint-url",
+    help="Alternative service endpoint, e.g. http://localhost:4566 for LocalStack.",
+)
+@click.option("--max-parallel", type=int, help="Cap on units deployed at once.")
+@click.option(
+    "--strategy",
+    type=click.Choice(STRATEGIES),
+    help="rolling starts each unit as soon as its own dependencies are done (default); "
+    "waves adds a barrier between topological generations.",
+)
+@click.option("--plan-only", is_flag=True, help="Show the plan and exit without deploying.")
 @click.option(
     "--dry-run",
     is_flag=True,
     help="Walk the plan with simulated deployments. Touches no cloud account; timings are fake.",
 )
+@click.option(
+    "--validate/--no-validate",
+    default=True,
+    show_default=True,
+    help="Ask the backend to check every template before creating anything.",
+)
+@click.option("--report-json", type=click.Path(), help="Write the run report as JSON to this path.")
 @click.option("--yes", is_flag=True, help="Skip the confirmation prompt before a real deployment.")
 def deploy(
     path: str,
@@ -84,23 +131,35 @@ def deploy(
     config_path: str | None,
     parameter: tuple[str, ...],
     region: str | None,
+    profile: str | None,
+    endpoint_url: str | None,
     max_parallel: int | None,
+    strategy: str | None,
     plan_only: bool,
     dry_run: bool,
+    validate: bool,
+    report_json: str | None,
     yes: bool,
 ) -> None:
-    """Discover the units under PATH, order them, and deploy them in waves."""
+    """Discover the units under PATH, order them, and deploy them."""
     config, resolved_backend = _load(path, config_path, backend)
     config.parameters.update(_parse_parameters(parameter))
     if region:
         config.region = region
+    if profile:
+        config.profile = profile
+    if endpoint_url:
+        config.endpoint_url = endpoint_url
     if max_parallel:
         config.max_parallel = max_parallel
 
     try:
         adapter = build_adapter(resolved_backend, config)
         orchestrator = Orchestrator(
-            adapter, max_parallel=config.max_parallel, extra_dependencies=config.depends_on
+            adapter,
+            max_parallel=config.max_parallel,
+            extra_dependencies=config.depends_on,
+            strategy=strategy or "rolling",
         )
         plan = orchestrator.plan(path)
     except (AdapterError, PlanError) as exc:
@@ -126,25 +185,41 @@ def deploy(
     if plan_only:
         return
 
+    if not dry_run and validate:
+        _preflight(adapter, plan)
+
     if not dry_run and not yes:
-        click.confirm(
-            "\nDeploy " + str(plan.unit_count) + " unit(s) to AWS in " + str(len(plan.waves)) + " wave(s)?",
-            abort=True,
-        )
+        settings = config.aws_settings()
+        target = "LocalStack" if settings.is_local else "AWS"
+        click.echo("")
+        click.secho("target: " + target + " (" + settings.describe() + ")", fg="cyan")
+        click.confirm("Deploy " + str(plan.unit_count) + " unit(s) to " + target + "?", abort=True)
 
     click.echo("")
     label = "simulating" if dry_run else "deploying"
-    click.echo(label + " " + str(plan.unit_count) + " unit(s)...")
+    click.echo(label + " " + str(plan.unit_count) + " unit(s), strategy=" + orchestrator.strategy)
+    if not dry_run:
+        click.secho("Ctrl-C stops scheduling; units already started are left to finish.", fg="cyan")
 
     def on_status(name: str, status: UnitStatus) -> None:
         if status in (UnitStatus.PENDING,):
             return
         click.secho("  %-24s %s" % (name, status.value), fg=_STATUS_COLOURS.get(status, "white"))
 
-    report = orchestrator.run(plan, dry_run=dry_run, on_status=on_status)
+    try:
+        report = orchestrator.run(plan, dry_run=dry_run, on_status=on_status)
+    except KeyboardInterrupt:
+        orchestrator.cancel()
+        raise click.ClickException("interrupted before the run could report") from None
 
     click.echo("")
     click.echo(report.summary())
+
+    if report_json:
+        with open(report_json, "w", encoding="utf-8") as handle:
+            json.dump(report.to_dict(), handle, indent=2)
+        click.echo("")
+        click.echo("report written to " + report_json)
 
     if not report.succeeded:
         failed = report.by_status(UnitStatus.FAILED)
@@ -239,6 +314,8 @@ def graph(
 )
 @click.option("--cluster", help="ECS cluster. Discovered automatically when omitted.")
 @click.option("--region", help="AWS region. Falls back to AWS_REGION.")
+@click.option("--profile", help="AWS named profile.")
+@click.option("--endpoint-url", help="Alternative service endpoint, e.g. LocalStack.")
 @click.option("--days", default=DEFAULT_PERIOD_DAYS, show_default=True, help="Analysis window.")
 @click.option("--json", "as_json", is_flag=True, help="Emit the report as JSON.")
 def optimize(
@@ -247,6 +324,8 @@ def optimize(
     resource_type: str,
     cluster: str | None,
     region: str | None,
+    profile: str | None,
+    endpoint_url: str | None,
     days: int,
     as_json: bool,
 ) -> None:
@@ -260,7 +339,8 @@ def optimize(
         resource_type = "ecs-service"
 
     try:
-        report = Optimizer(region=region, period_days=days).analyse(
+        settings = AwsSettings(region=region, profile=profile, endpoint_url=endpoint_url)
+        report = Optimizer(settings=settings, period_days=days).analyse(
             identifier, resource_type=resource_type, cluster=cluster
         )
     except OptimizerError as exc:
@@ -328,7 +408,7 @@ def explain(
             resource_type = "ecs-service"
         try:
             payload = (
-                Optimizer(region=region, period_days=days)
+                Optimizer(settings=AwsSettings(region=region), period_days=days)
                 .analyse(identifier, resource_type=resource_type, cluster=cluster)
                 .to_dict()
             )

@@ -28,7 +28,7 @@ def build_adapter(backend: str, config: ArgusConfig | None = None) -> Infrastruc
         return CloudFormationAdapter(
             parameters=config.parameters,
             stack_name_prefix=config.stack_name_prefix,
-            region=config.region,
+            settings=config.aws_settings(),
         )
 
     if backend == "terraform":

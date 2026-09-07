@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from argus.aws import AwsSettings
 from argus.optimizer import (
     FARGATE_LADDER,
     MetricSample,
@@ -159,7 +160,9 @@ class FakeSession:
     def __init__(self, clients):
         self._clients = clients
 
-    def client(self, service):
+    def client(self, service, **kwargs):
+        # build_client passes a botocore Config (and endpoint_url when set);
+        # accepting them here keeps the fake honest about the real call shape.
         return self._clients[service]
 
 
@@ -220,7 +223,7 @@ def build_optimizer(finding="OVER_PROVISIONED", cpu_p95=10.0, memory_p95=15.0):
     session = FakeSession(
         {"cloudwatch": cloudwatch, "ecs": ecs, "compute-optimizer": compute_optimizer}
     )
-    return Optimizer(region="eu-west-3", session=session)
+    return Optimizer(settings=AwsSettings(region="eu-west-3"), session=session)
 
 
 def test_end_to_end_report_puts_both_verdicts_side_by_side():

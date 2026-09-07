@@ -126,5 +126,34 @@ def test_a_dry_run_deployment_completes_and_reports_the_comparison(app):
 
     assert result.exception == []
     metrics = {element.label: element.value for element in result.metric}
-    assert "Parallel waves" in metrics
+    assert "Wall clock" in metrics
     assert "Sequential equivalent" in metrics
+    # The floor the run is measured against, and how close it got.
+    assert "Critical path floor" in metrics
+    assert metrics["Efficiency"].endswith("%")
+
+
+def test_the_page_reports_the_critical_path_not_just_the_wave_count(app):
+    metrics = {element.label: element.value for element in app.metric}
+    # The wave count flatters the plan; the critical path is the real limit.
+    assert metrics["Critical path"] == "7"
+
+
+def test_the_page_offers_both_scheduling_strategies(app):
+    options = [option for element in app.selectbox for option in element.options]
+    assert "rolling" in options and "waves" in options
+
+
+def test_an_endpoint_can_be_pointed_at_localstack():
+    AppTest = pytest.importorskip("streamlit.testing.v1").AppTest
+    at = AppTest.from_file(APP, default_timeout=120)
+    at.run()
+
+    endpoint = next(
+        element for element in at.text_input if element.label == "Endpoint"
+    )
+    result = endpoint.set_value("http://localhost:4566").run()
+
+    assert result.exception == []
+    # The page must say when it is not talking to AWS.
+    assert any("not to AWS" in caption.value for caption in result.caption)

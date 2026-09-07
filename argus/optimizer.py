@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .aws import AwsSettings, build_client, build_session
+
 DEFAULT_PERIOD_DAYS = 14
 DEFAULT_REGION_HINT = "set --region or AWS_REGION"
 
@@ -379,19 +381,26 @@ def _step(resource: ResourceMetrics, direction: int) -> tuple[dict[str, Any], di
 class Optimizer:
     """Reads CloudWatch and Compute Optimizer for one resource."""
 
-    def __init__(self, region: str | None = None, session: Any = None, period_days: int = DEFAULT_PERIOD_DAYS):
-        self.region = region
+    def __init__(
+        self,
+        settings: AwsSettings | None = None,
+        session: Any = None,
+        period_days: int = DEFAULT_PERIOD_DAYS,
+    ):
+        self.settings = settings or AwsSettings()
         self.period_days = period_days
         self._session = session
         self._clients: dict[str, Any] = {}
 
+    @property
+    def region(self) -> str | None:
+        return self.settings.region
+
     def client(self, service: str):
         if service not in self._clients:
             if self._session is None:
-                import boto3
-
-                self._session = boto3.session.Session(region_name=self.region)
-            self._clients[service] = self._session.client(service)
+                self._session = build_session(self.settings)
+            self._clients[service] = build_client(self._session, service, self.settings)
         return self._clients[service]
 
     @property

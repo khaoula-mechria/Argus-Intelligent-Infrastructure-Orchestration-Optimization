@@ -10,11 +10,13 @@ deploy several independent stacks in parallel while inferring their order.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from typing import Any, Iterable
 
 import yaml
 
+from ..aws import AwsSettings, build_client, build_session, call_with_backoff, poll_delays
 from .base import AdapterError, DeployableUnit, DeploymentResult, InfrastructureAdapter, UnitStatus
 
 #: CreateStack refuses an inline body above this size; larger templates must
@@ -218,20 +220,26 @@ class CloudFormationAdapter(InfrastructureAdapter):
         parameters: dict[str, str] | None = None,
         *,
         stack_name_prefix: str = "",
-        region: str | None = None,
+        settings: AwsSettings | None = None,
         session: Any = None,
+        client: Any = None,
         capabilities: Iterable[str] = ("CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"),
-        poll_interval: int = 10,
-        timeout: int = 3600,
+        poll_interval: float = 10.0,
+        timeout: float = 3600.0,
     ) -> None:
         self.parameters = dict(parameters or {})
         self.stack_name_prefix = stack_name_prefix
-        self.region = region
+        self.settings = settings or AwsSettings()
         self.capabilities = list(capabilities)
         self.poll_interval = poll_interval
         self.timeout = timeout
         self._session = session
-        self._client = None
+        self._client = client
+        self._client_lock = threading.Lock()
+
+    @property
+    def region(self) -> str | None:
+        return self.settings.region
 
     # -- discovery ---------------------------------------------------------
 
@@ -281,12 +289,42 @@ class CloudFormationAdapter(InfrastructureAdapter):
 
     @property
     def client(self):
-        if self._client is None:
-            import boto3
+        """The CloudFormation client, built once and shared across threads.
 
-            session = self._session or boto3.session.Session(region_name=self.region)
-            self._client = session.client("cloudformation")
+        boto3 clients are thread-safe once constructed but their construction
+        is not, and the orchestrator deploys a wave from several threads, so
+        the first access is guarded.
+        """
+        if self._client is None:
+            with self._client_lock:
+                if self._client is None:
+                    session = self._session or build_session(self.settings)
+                    self._client = build_client(session, "cloudformation", self.settings)
         return self._client
+
+    # -- pre-flight --------------------------------------------------------
+
+    def validate(self, units: Iterable[DeployableUnit]) -> dict[str, str]:
+        """Ask CloudFormation to check each template before anything is created.
+
+        Cheap insurance against the worst failure mode of a parallel deploy: a
+        wave succeeds, the next one starts, and a template five stacks in turns
+        out to be malformed -- leaving a half-built environment behind. One
+        round of ``validate_template`` up front catches that for the price of a
+        few API calls.
+
+        Returns the templates that failed, keyed by unit name. An empty mapping
+        means every template parsed.
+        """
+        failures: dict[str, str] = {}
+        for unit in units:
+            try:
+                with open(unit.path, "r", encoding="utf-8") as handle:
+                    body = handle.read()
+                self.client.validate_template(TemplateBody=body)
+            except Exception as exc:
+                failures[unit.name] = _clean_error(exc)
+        return failures
 
     def deploy_unit(self, unit: DeployableUnit) -> DeploymentResult:
         started = time.monotonic()
@@ -313,17 +351,22 @@ class CloudFormationAdapter(InfrastructureAdapter):
             "Capabilities": self.capabilities,
         }
 
-        try:
+        def submit() -> str:
+            # Existence check and the call it decides are retried together: a
+            # throttled retry of only the inner call could act on a stale
+            # answer and create a stack that already exists.
             if self._stack_exists(stack_name):
                 self.client.update_stack(**request)
-                action = "update"
-            else:
-                self.client.create_stack(OnFailure="ROLLBACK", **request)
-                action = "create"
+                return "update"
+            self.client.create_stack(OnFailure="ROLLBACK", **request)
+            return "create"
+
+        try:
+            action = call_with_backoff(submit)
         except Exception as exc:  # botocore client errors are not a stable class here
             if "No updates are to be performed" in str(exc):
                 return DeploymentResult.timed(unit.name, UnitStatus.COMPLETE, started, "no changes")
-            return DeploymentResult.timed(unit.name, UnitStatus.FAILED, started, str(exc))
+            return DeploymentResult.timed(unit.name, UnitStatus.FAILED, started, _clean_error(exc))
 
         status, detail = self._wait_for_stack(stack_name)
         return DeploymentResult.timed(unit.name, status, started, detail or action)
@@ -333,21 +376,76 @@ class CloudFormationAdapter(InfrastructureAdapter):
             stacks = self.client.describe_stacks(StackName=stack_name)["Stacks"]
         except Exception:  # ValidationError when the stack does not exist
             return False
+        # REVIEW_IN_PROGRESS means a change set was created but never executed,
+        # so there is nothing to update: the stack has to be created.
         return bool(stacks) and stacks[0]["StackStatus"] != "REVIEW_IN_PROGRESS"
 
     def _wait_for_stack(self, stack_name: str) -> tuple[UnitStatus, str]:
         """Poll describe_stacks until the stack settles, or the timeout hits."""
-        deadline = time.monotonic() + self.timeout
-        while time.monotonic() < deadline:
+        for delay in poll_delays(self.poll_interval, self.timeout):
             try:
-                stack = self.client.describe_stacks(StackName=stack_name)["Stacks"][0]
+                stack = call_with_backoff(
+                    lambda: self.client.describe_stacks(StackName=stack_name)["Stacks"][0]
+                )
             except Exception as exc:
-                return UnitStatus.FAILED, str(exc)
-            status = self._translate(stack["StackStatus"])
+                return UnitStatus.FAILED, _clean_error(exc)
+
+            raw = stack["StackStatus"]
+            status = self._translate(raw)
             if status.is_terminal:
-                return status, stack.get("StackStatusReason", stack["StackStatus"])
-            time.sleep(self.poll_interval)
-        return UnitStatus.FAILED, "timed out after " + str(self.timeout) + "s waiting for " + stack_name
+                if status == UnitStatus.FAILED:
+                    # StackStatusReason on the stack itself is usually the
+                    # useless "The following resource(s) failed to create".
+                    # The actionable message is on the resource event.
+                    return status, self.failure_reason(stack_name) or raw
+                return status, stack.get("StackStatusReason") or raw
+            time.sleep(delay)
+
+        return UnitStatus.FAILED, (
+            "timed out after " + str(int(self.timeout)) + "s waiting for " + stack_name
+            + " (last status: " + self.raw_status(stack_name) + ")"
+        )
+
+    def failure_reason(self, stack_name: str) -> str:
+        """The first resource that actually failed, and why.
+
+        ``describe_stack_events`` returns newest first, so the last failure in
+        the list is the earliest one -- the root cause, before the cascade of
+        rollback events it triggered.
+        """
+        try:
+            pages = self.client.get_paginator("describe_stack_events").paginate(
+                StackName=stack_name
+            )
+            events = [event for page in pages for event in page.get("StackEvents", [])]
+        except Exception:
+            return ""
+
+        culprits = [
+            event
+            for event in events
+            if str(event.get("ResourceStatus", "")).endswith("_FAILED")
+            and event.get("ResourceStatusReason")
+            # A resource cancelled because a sibling failed is a symptom.
+            and "cancelled" not in str(event.get("ResourceStatusReason", "")).lower()
+        ]
+        if not culprits:
+            return ""
+
+        root = culprits[-1]
+        return (
+            str(root.get("LogicalResourceId", "?"))
+            + " ("
+            + str(root.get("ResourceType", "?"))
+            + "): "
+            + str(root.get("ResourceStatusReason", "")).strip()
+        )
+
+    def raw_status(self, stack_name: str) -> str:
+        try:
+            return self.client.describe_stacks(StackName=stack_name)["Stacks"][0]["StackStatus"]
+        except Exception:
+            return "unknown"
 
     @staticmethod
     def _translate(raw: str) -> UnitStatus:
@@ -364,3 +462,21 @@ class CloudFormationAdapter(InfrastructureAdapter):
         except Exception:  # absent stack, or no usable credentials
             return UnitStatus.UNKNOWN
         return self._translate(stack["StackStatus"])
+
+
+def _clean_error(exc: BaseException) -> str:
+    """Readable one-liner from a botocore exception.
+
+    botocore messages arrive with the operation name and a stack trace of
+    context wrapped around them; the part a user can act on is the message
+    itself.
+    """
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error") or {}
+        code, message = error.get("Code"), error.get("Message")
+        if code and message:
+            return str(code) + ": " + str(message)
+        if message:
+            return str(message)
+    return " ".join(str(exc).split())
