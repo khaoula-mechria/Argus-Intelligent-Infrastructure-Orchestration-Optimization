@@ -1,0 +1,14 @@
+# Argus runtime dependencies.
+#
+# The CloudFormation backend needs boto3 + PyYAML; the Terraform backend adds
+# pydot to read `terraform graph` output. Streamlit is only needed for
+# `argus dashboard`, anthropic only for `argus explain`; both are listed here
+# because the CLI ships all four modules.
+
+boto3>=1.34
+PyYAML>=6.0
+networkx>=3.0
+click>=8.1
+pydot>=2.0
+streamlit>=1.30
+anthropic>=0.40

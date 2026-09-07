@@ -1,0 +1,24 @@
+# Argus project file for this repository.
+#
+# The CloudFormation stacks under infrastructure/cloudformation/ already
+# express most of their dependencies through Outputs.Export.Name and
+# Fn::ImportValue, so Argus infers 20 of the 21 edges on its own. This file
+# only supplies what the templates do not say out loud.
+
+backend: cloudformation
+path: infrastructure/cloudformation
+
+parameters:
+  ProjectName: taskmanager
+  Environment: dev
+
+max_parallel: 6
+
+# alb.yaml receives VpcId and PublicSubnetIds as stack *parameters* rather
+# than importing them (a deliberate choice in that template: see its parameter
+# descriptions, which name vpc.yaml as the expected source). No export/import
+# pair exists, so Argus cannot see the dependency and would otherwise schedule
+# the ALB in the same wave as the VPC. Declared explicitly here.
+depends_on:
+  alb:
+    - vpc
