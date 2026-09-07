@@ -6,6 +6,18 @@ qu'en suivant un ordre figé.**
 
 ---
 
+## Par où commencer
+
+| Vous voulez… | Guide |
+|---|---|
+| Essayer sans compte cloud, sans clé, sans risque | **[Guide local](docs/guide-local.md)** — graphe, dry-run, dashboard, Terraform local, et de vrais déploiements CloudFormation via LocalStack |
+| L'utiliser sur un vrai compte AWS | **[Guide cloud](docs/guide-cloud.md)** — identifiants, politiques IAM minimales, coûts, déploiement prudent, nettoyage |
+
+Le reste de ce README est la référence : ce que fait l'outil, ce qu'il ne fait
+pas, et pourquoi.
+
+---
+
 ## Sommaire
 
 1. [Comment ça marche selon le backend](#comment-ça-marche-selon-le-backend)
@@ -111,7 +123,14 @@ backend: cloudformation
   wave 5: ecs-service
   wave 6: pipeline
   wave 7: ecs-autoscaling, observability
+critical path (7 units): secrets-manager -> codebuild -> iam -> ecs-task-definition -> ecs-service -> pipeline -> ecs-autoscaling
+peak concurrency: 4
 ```
+
+Le **chemin critique** est la limite structurelle : aucun ordonnanceur, aucun
+parallélisme ne peut descendre en dessous de cette chaîne. La raccourcir
+demande de changer l'infrastructure, pas l'outil. La **concurrence maximale**
+dit à partir d'où augmenter `--max-parallel` ne sert plus à rien.
 
 Les 12 étapes séquentielles documentées dans
 [`infrastructure/README.md`](infrastructure/README.md) se ramènent à **7 vagues**,
@@ -235,6 +254,8 @@ dossier qui contient `.git`).
 backend: cloudformation          # cloudformation | terraform
 path: infrastructure/cloudformation
 region: eu-west-3
+profile: argus-dev               # profil AWS nommé (facultatif)
+endpoint_url: ""                 # http://localhost:4566 pour LocalStack
 max_parallel: 6                  # plafond d'unités déployées simultanément
 stack_name_prefix: ""            # préfixe des noms de stacks CloudFormation
 
@@ -292,26 +313,60 @@ argus deploy infrastructure/cloudformation \
 | `--backend` | `cloudformation` ou `terraform`. Sinon lu dans `argus.yaml`. |
 | `--config` | Chemin explicite vers un `argus.yaml`. |
 | `-p / --parameter` | `Clé=Valeur`, répétable. Prioritaire sur `argus.yaml`. |
+| `--profile` | Profil AWS nommé. |
+| `--endpoint-url` | Endpoint alternatif, ex. `http://localhost:4566` pour LocalStack. |
+| `--strategy` | `rolling` (défaut) ou `waves`. Voir ci-dessous. |
 | `--plan-only` | Affiche le plan et s'arrête. |
 | `--dry-run` | Déroule le plan avec des déploiements simulés. Aucun appel cloud. |
+| `--validate / --no-validate` | Valide chaque template avant de créer quoi que ce soit. Actif par défaut. |
+| `--report-json` | Écrit le rapport de run en JSON. |
 | `--yes` | Saute la confirmation avant un déploiement réel. |
-| `--max-parallel` | Plafond d'unités simultanées dans une vague. |
+| `--max-parallel` | Plafond d'unités déployées simultanément. |
 
-À la fin, Argus mesure l'horloge murale et la compare à la somme des durées
-individuelles — ce qu'un déroulé strictement séquentiel aurait coûté. Voici la
-sortie réelle du dry-run sur les 12 stacks de ce dépôt :
+#### Les deux ordonnanceurs, et pourquoi ça compte
+
+`waves` déploie les générations topologiques une par une, avec une **barrière**
+entre elles : toute une vague attend son unité la plus lente. Une stack rapide
+dont l'unique dépendance est déjà terminée patiente donc derrière une stack
+lente qui n'a rien à voir avec elle.
+
+`rolling` (le défaut) démarre chaque unité dès que **ses propres** prédécesseurs
+sont terminés. Sur les 12 stacks de ce dépôt, en dry-run, la différence est
+mesurable et reproductible :
+
+```bash
+argus deploy infrastructure/cloudformation --dry-run --strategy waves
+argus deploy infrastructure/cloudformation --dry-run --strategy rolling
+```
+
+| Stratégie | Wall clock | Efficacité vs le plancher |
+|---|---|---|
+| `waves` | 1.5 s | 83 % |
+| `rolling` | 1.3 s | **100 %** |
+
+Le rapport complet de `rolling` :
 
 ```
-SIMULATED wall clock (parallel waves) : 1.5s
+SIMULATED strategy                    : rolling
+SIMULATED wall clock                  : 1.3s
 SIMULATED sequential equivalent       : 2.0s
-SIMULATED saved                       : 0.5s (x1.30)
+SIMULATED critical path (the floor)   : 1.3s  [vpc -> alb -> ecs-service -> pipeline -> observability]
+SIMULATED saved vs sequential         : 0.7s (x1.56)
+SIMULATED efficiency vs the floor     : 100%
 ```
 
-Le préfixe `SIMULATED` n'apparaît qu'en dry-run, et ces durées-là sont dérivées
-du nombre de ressources par template, pas d'AWS. Sur un vrai déploiement le même
-bloc s'affiche sans préfixe, avec des mesures réelles — et l'écart y est bien
-plus marqué, puisque les stacks lentes (VPC, ALB) durent des minutes et non des
-millisecondes.
+Deux points sur ces chiffres :
+
+* **`SIMULATED` n'est pas décoratif.** En dry-run, les durées sont dérivées du
+  nombre de ressources par template, pas d'AWS. Elles démontrent la structure,
+  elles ne prédisent aucun temps réel. Sur un vrai déploiement, le même bloc
+  s'affiche sans préfixe et l'écart est bien plus marqué, puisque VPC et ALB
+  durent des minutes.
+* **L'efficacité se lit contre le chemin critique**, pas contre le déroulé
+  séquentiel. C'est délibéré : la comparaison séquentielle flatte n'importe
+  quelle implémentation parallèle, alors que le chemin critique est un plancher
+  que rien ne peut franchir. 100 % veut dire qu'aucune seconde n'a été perdue
+  ailleurs que sur une vraie dépendance.
 
 Une unité dont une dépendance a échoué est marquée `SKIPPED` et n'est pas tentée :
 elle échouerait de toute façon sur un export manquant et ajouterait une seconde
@@ -351,10 +406,27 @@ argus dashboard --port 8501
 
 ### Module 1 — Orchestrateur
 
-`discover_units` → `build_dependency_graph` → tri topologique en vagues →
-déploiement parallèle intra-vague → mesure parallèle vs séquentiel. Écrit
+`discover_units` → `build_dependency_graph` → ordonnancement → mesure. Écrit
 entièrement au-dessus de l'interface `InfrastructureAdapter` : il ne sait pas ce
 qu'est une stack ni un state.
+
+L'ordonnanceur par défaut est **à flux tendu** : chaque unité démarre dès que
+ses propres prédécesseurs sont terminés, sans barrière de vague. Les vagues
+restent calculées — elles servent à l'affichage, au dessin du graphe, et de
+référence de comparaison via `--strategy waves`.
+
+Trois mesures, toutes issues de mesures et non d'estimations : l'horloge murale,
+l'équivalent séquentiel (somme des durées individuelles) et le **chemin
+critique** (la plus longue chaîne, pondérée par ces mêmes durées) — c'est-à-dire
+le plancher qu'aucun ordonnanceur ne peut franchir.
+
+Robustesse : une unité dont une dépendance a échoué est marquée `SKIPPED`
+**transitivement** et n'est pas tentée ; `Ctrl-C` arrête l'ordonnancement mais
+laisse finir les unités déjà lancées (tuer le processus n'arrête pas
+CloudFormation, ça ne fait que perdre sa trace) ; deux unités de même nom sont
+un refus et non une fusion silencieuse dans le graphe ; et chaque unité obtient
+une ligne dans le rapport, y compris celles que l'annulation n'a jamais
+atteintes.
 
 ### Module 2 — Optimization Engine
 
@@ -399,7 +471,11 @@ même `networkx.DiGraph`, **aucun code de rendu ne branche sur le backend**.
 * Nœuds colorés par statut, arêtes vers une unité `IN_PROGRESS` épaissies.
 * Une arête déclarée dans `argus.yaml` est dessinée en pointillés et étiquetée :
   on distingue ce qu'Argus a découvert de ce qu'un humain a affirmé.
-* Chrono comparatif séquentiel vs parallèle.
+* Chrono comparatif : horloge murale, équivalent séquentiel, plancher du chemin
+  critique, et l'efficacité atteinte. Un sélecteur permet de rejouer la
+  comparaison `rolling` / `waves` en regardant les nœuds s'allumer.
+* Un champ **Endpoint** : le pointer sur LocalStack fait tourner toute la page
+  sans compte cloud, avec un bandeau qui le rappelle à l'écran.
 * Le déploiement est en dry-run par défaut ; un déploiement réel exige de taper
   le nom du backend pour confirmer, parce que la page ne peut pas l'annuler.
 * Le seul élément spécifique au backend est le bandeau qui dit ce qu'Argus fait
@@ -445,13 +521,25 @@ dessous.)
 présentes ou non). Il ne distingue pas un module appliqué d'un module qui a
 dérivé depuis.
 
-**8. Ce qui n'a pas été exécuté ici.** Le graphe, l'ordonnancement, le parsing
+**8. Argus ne passe pas de rôle de service CloudFormation.** Sans lui,
+l'identité qui déploie a besoin des permissions de chaque type de ressource
+créé. Le [guide cloud](docs/guide-cloud.md#permissions-iam) explique comment
+associer le rôle à chaque stack pour éviter ça.
+
+**9. Modules 2 et 3 : AWS uniquement.** L'orchestration fonctionne avec
+n'importe quel fournisseur via Terraform (Argus ne regarde pas dans les
+modules), mais l'optimisation s'appuie sur CloudWatch et Compute Optimizer, qui
+n'ont pas d'équivalent branché sur Azure ou GCP.
+
+**10. Ce qui n'a pas été exécuté ici.** Le graphe, l'ordonnancement, le parsing
 DOT, le front et le dry-run tournent et sont testés dans ce dépôt. En revanche,
-faute de credentials AWS valides et de binaire `terraform` dans l'environnement
-de développement, **le chemin `deploy` réel (boto3 `create_stack`, `terraform
-apply`) et les appels CloudWatch / Compute Optimizer n'ont pas été exercés contre
-de vraies API** — ils sont couverts par des tests à clients simulés, ce qui n'est
-pas la même chose.
+faute de credentials AWS valides, de binaire `terraform` et d'un démon Docker
+actif dans l'environnement de développement, **ni le déploiement réel (boto3
+`create_stack`, `terraform apply`), ni le parcours LocalStack, ni les appels
+CloudWatch / Compute Optimizer n'ont tourné contre une API réelle**. Ils sont
+couverts par des tests contre les modèles de service réels de botocore
+(`tests/test_aws_contract.py`), ce qui vérifie la forme des requêtes mais pas le
+comportement du service.
 
 ---
 
@@ -467,6 +555,7 @@ argus/
   optimizer.py         Module 2 : CloudWatch + règle de seuil + Compute Optimizer
   explainer.py         Module 3 : API Anthropic, jamais d'auto-application
   dashboard.py         Module 4 : Streamlit, agnostique du backend
+  aws.py               clients AWS : retries adaptatifs, endpoint, backoff
   config.py            lecture d'argus.yaml
   cli.py               la commande `argus`
 ```
@@ -499,10 +588,17 @@ au-dessus de cette couche ne change.
 python -m pytest tests -q
 ```
 
-113 tests, sans credentials AWS ni binaire `terraform` : les appels cloud passent
-par des clients simulés, `terraform` par une couture (`runner`), et le parsing
-DOT est vérifié contre une sortie réelle de `terraform graph -type=plan`
-capturée dans [`tests/fixtures/`](tests/fixtures/).
+146 tests, sans credentials AWS ni binaire `terraform` : `terraform` passe par
+une couture (`runner`), et le parsing DOT est vérifié contre une sortie réelle de
+`terraform graph -type=plan` capturée dans [`tests/fixtures/`](tests/fixtures/).
+
+Les appels AWS sont couverts à deux niveaux. Des faux clients vérifient la
+**logique** ; et [`tests/test_aws_contract.py`](tests/test_aws_contract.py)
+valide les requêtes et les réponses contre les **modèles de service réels** de
+botocore, via `botocore.stub.Stubber` — ce que les faux clients ne font pas,
+puisqu'ils acceptent n'importe quel nom de paramètre. Une faute de frappe dans
+`create_stack` passait toutes les autres épreuves ; elle échoue là. (Ces tests
+ont d'ailleurs trouvé deux erreurs de forme de requête pendant leur écriture.)
 
 Une partie des tests s'exécute contre les **vraies stacks de ce dépôt** : le
 graphe est acyclique, aucun import n'est laissé insatisfait, et l'ordre calculé
