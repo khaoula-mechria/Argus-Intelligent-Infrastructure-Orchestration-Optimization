@@ -26,3 +26,8 @@ include = ["argus*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    # pydot 4 still calls pyparsing's camelCase API; not ours to fix.
+    "ignore:.*setParseAction.*:DeprecationWarning",
+    "ignore:.*setParseAction.*",
+]

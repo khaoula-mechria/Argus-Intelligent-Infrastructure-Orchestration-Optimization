@@ -140,6 +140,16 @@ class InfrastructureAdapter(ABC):
 
         return graph
 
+    def inspect_unit(self, unit: DeployableUnit) -> nx.DiGraph | None:
+        """The backend's own internal graph for one unit, for display only.
+
+        Some backends schedule work inside a unit themselves (Terraform inside
+        one state). Returning that graph lets the front end show what will
+        happen without Argus pretending to orchestrate it. ``None`` means the
+        backend has nothing finer-grained to show.
+        """
+        return None
+
     def unresolved_requirements(self, units: Iterable[DeployableUnit]) -> dict[str, list[str]]:
         """Names a unit consumes that nothing in the project provides.
 

@@ -113,6 +113,50 @@ def status_legend() -> None:
         )
 
 
+def single_module_graph(adapter, plan):
+    """Terraform's own resource graph, when there is exactly one root module.
+
+    Returned only in that case: with several modules the unit-level graph is
+    the one Argus actually orchestrates, and that is what belongs on screen.
+    """
+    if len(plan.units) != 1 or not plan.units[0].metadata.get("single_module"):
+        return None
+    graph = adapter.inspect_unit(plan.units[0])
+    return graph if graph is not None and graph.number_of_nodes() else None
+
+
+#: Fill per resource kind in a backend's internal graph.
+KIND_STYLE = {
+    "resource": ("#d2e3fc", "#1967d2"),
+    "data": ("#e6f4ea", "#137333"),
+    "variable": ("#f1f3f4", "#5f6368"),
+    "local": ("#f1f3f4", "#5f6368"),
+    "output": ("#fef7e0", "#b06000"),
+    "module": ("#e9d2fd", "#6b21a8"),
+}
+
+
+def build_resource_dot(graph) -> str:
+    """Render a backend-internal graph. No status: Argus does not drive these."""
+    lines = [
+        "digraph resources {",
+        "  rankdir=LR;",
+        "  bgcolor=transparent;",
+        '  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10];',
+        '  edge [color="#9aa0a6"];',
+    ]
+    for name, data in graph.nodes(data=True):
+        fill, border = KIND_STYLE.get(data.get("kind", "resource"), KIND_STYLE["resource"])
+        lines.append(
+            '  "' + name + '" [fillcolor="' + fill + '", color="' + border
+            + '", fontcolor="' + border + '"];'
+        )
+    for source, target in graph.edges():
+        lines.append('  "' + source + '" -> "' + target + '";')
+    lines.append("}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Backend honesty banner
 # ---------------------------------------------------------------------------
@@ -200,9 +244,20 @@ def render_deployment_tab(backend: str, path: str) -> None:
         )
 
     statuses = st.session_state.get("statuses", {})
-    status_legend()
-    graph_slot = st.empty()
-    graph_slot.graphviz_chart(build_dot(plan, statuses), width="stretch")
+
+    inner = single_module_graph(adapter, plan)
+    if inner is not None:
+        st.caption(
+            "Rendered from " + plan.units[0].metadata.get("graph_source", "the backend")
+            + " -- " + str(inner.number_of_nodes()) + " resources, "
+            + str(inner.number_of_edges()) + " dependencies. Terraform schedules these itself."
+        )
+        st.graphviz_chart(build_resource_dot(inner), width="stretch")
+        graph_slot = st.empty()
+    else:
+        status_legend()
+        graph_slot = st.empty()
+        graph_slot.graphviz_chart(build_dot(plan, statuses), width="stretch")
 
     st.divider()
     st.markdown("**Run**")

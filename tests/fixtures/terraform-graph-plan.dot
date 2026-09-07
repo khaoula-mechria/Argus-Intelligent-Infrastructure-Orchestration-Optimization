@@ -1,0 +1,23 @@
+digraph {
+	compound = "true"
+	newrank = "true"
+	subgraph "root" {
+		"[root] data.terraform_remote_state.shared (expand)" [label = "data.terraform_remote_state.shared", shape = "box"]
+		"[root] output.vpc_id (expand)" [label = "output.vpc_id", shape = "note"]
+		"[root] provider[\"terraform.io/builtin/terraform\"]" [label = "provider[\"terraform.io/builtin/terraform\"]", shape = "diamond"]
+		"[root] terraform_data.subnet_a (expand)" [label = "terraform_data.subnet_a", shape = "box"]
+		"[root] terraform_data.subnet_b (expand)" [label = "terraform_data.subnet_b", shape = "box"]
+		"[root] terraform_data.vpc (expand)" [label = "terraform_data.vpc", shape = "box"]
+		"[root] var.region" [label = "var.region", shape = "note"]
+		"[root] data.terraform_remote_state.shared (expand)" -> "[root] provider[\"terraform.io/builtin/terraform\"]"
+		"[root] output.vpc_id (expand)" -> "[root] terraform_data.vpc (expand)"
+		"[root] terraform_data.subnet_a (expand)" -> "[root] terraform_data.vpc (expand)"
+		"[root] terraform_data.subnet_b (expand)" -> "[root] terraform_data.vpc (expand)"
+		"[root] terraform_data.vpc (expand)" -> "[root] provider[\"terraform.io/builtin/terraform\"]"
+		"[root] terraform_data.vpc (expand)" -> "[root] var.region"
+		"[root] provider[\"terraform.io/builtin/terraform\"] (close)" -> "[root] terraform_data.subnet_a (expand)"
+		"[root] provider[\"terraform.io/builtin/terraform\"] (close)" -> "[root] terraform_data.subnet_b (expand)"
+		"[root] root" -> "[root] output.vpc_id (expand)"
+		"[root] root" -> "[root] provider[\"terraform.io/builtin/terraform\"] (close)"
+	}
+}
