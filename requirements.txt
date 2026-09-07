@@ -10,5 +10,5 @@ PyYAML>=6.0
 networkx>=3.0
 click>=8.1
 pydot>=2.0
-streamlit>=1.30
+streamlit>=1.50
 anthropic>=0.40
