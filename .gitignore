@@ -35,3 +35,9 @@ taskdef.rendered.json
 **/taskdef.rendered.json
 imageDetail.json
 **/imageDetail.json
+# Python artefacts d'Argus (paquet argus/, tests/).
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/

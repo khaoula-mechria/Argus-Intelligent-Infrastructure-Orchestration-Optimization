@@ -1,0 +1,18 @@
+# Two Terraform root modules with separate states.
+#
+# Terraform cannot infer that `app` needs `network` first: the two states
+# share nothing readable. Unlike CloudFormation, where exports and imports
+# make the dependency visible in the source, this has to be declared.
+
+backend: terraform
+
+modules:
+  - name: network
+    path: ./network
+
+  - name: app
+    path: ./app
+    depends_on:
+      - network
+    variables:
+      environment: dev

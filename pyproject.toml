@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "argus-infra"
+version = "0.1.0"
+description = "Deploy, visualise and optimise AWS infrastructure by discovering its real dependencies"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "boto3>=1.34",
+    "PyYAML>=6.0",
+    "networkx>=3.0",
+    "click>=8.1",
+    "pydot>=2.0",
+    "streamlit>=1.50",
+    "anthropic>=0.40",
+]
+
+[project.scripts]
+argus = "argus.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["argus*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    # pydot 4 still calls pyparsing's camelCase API; not ours to fix.
+    "ignore:.*setParseAction.*:DeprecationWarning",
+    "ignore:.*setParseAction.*",
+]
